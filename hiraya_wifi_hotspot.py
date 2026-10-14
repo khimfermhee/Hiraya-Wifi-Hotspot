@@ -9,22 +9,30 @@ Requires Administrator rights - the app will ask to elevate on launch.
 """
 
 import ctypes
+import html
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox, ttk
+
+import portal as captive
 
 APP_NAME = "Hiraya Wifi Hotspot"
 _APPDATA = os.environ.get("APPDATA", os.path.expanduser("~"))
 CONFIG_DIR = os.path.join(_APPDATA, "HirayaWifiHotspot")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+VOUCHER_FILE = os.path.join(CONFIG_DIR, "vouchers.json")
 OLD_CONFIG_FILE = os.path.join(_APPDATA, "WifiHotspot", "config.json")
 CREATE_NO_WINDOW = 0x08000000
 REFRESH_MS = 3000
+DEFAULT_HOTSPOT_IP = "192.168.137.1"
 
 
 # --------------------------------------------------------------------------- #
@@ -242,6 +250,18 @@ def stop_hotspot(disable_sharing: bool) -> tuple[bool, str]:
     return code == 0, out
 
 
+def hotspot_ip() -> str:
+    """IPv4 of the hosted network adapter (the ICS gateway), e.g. 192.168.137.1."""
+    name = hosted_adapter_name()
+    if name:
+        code, out = powershell(f"(Get-NetIPAddress -InterfaceAlias '{name}' -AddressFamily IPv4 "
+                               "-ErrorAction SilentlyContinue).IPAddress")
+        m = re.search(r"\d+\.\d+\.\d+\.\d+", out)
+        if m and not m.group(0).startswith("169.254."):
+            return m.group(0)
+    return DEFAULT_HOTSPOT_IP
+
+
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -316,12 +336,18 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("800x620")
-        self.minsize(760, 600)
+        self.geometry("880x700")
+        self.minsize(820, 640)
         self.configure(bg=BG)
         self.cfg = load_config()
         self.busy = False
         self.running = False
+        self.portal_busy = False
+        self.portal_error = ""
+        self.clients: list[str] = []
+        self.client_ips: dict[str, str] = {}
+        self.store = captive.VoucherStore(VOUCHER_FILE)
+        self.portal = captive.CaptivePortal(self.store, on_change=lambda: self.after(0, self.refresh_vouchers))
         self._style()
         self._build()
         self.after(100, self.refresh_adapters)
@@ -341,13 +367,26 @@ class App(tk.Tk):
         s.configure("TEntry", fieldbackground="#262a33", foreground=FG, insertcolor=FG, bordercolor="#333844")
         s.configure("TCombobox", fieldbackground="#262a33", foreground=FG, background="#262a33", arrowcolor=FG)
         s.map("TCombobox", fieldbackground=[("readonly", "#262a33")], foreground=[("readonly", FG)])
+        s.configure("TSpinbox", fieldbackground="#262a33", foreground=FG, background="#262a33", arrowcolor=FG)
         s.configure("Card.TCheckbutton", background=CARD, foreground=FG)
         s.map("Card.TCheckbutton", background=[("active", CARD)])
         s.configure("Treeview", background="#262a33", fieldbackground="#262a33", foreground=FG, rowheight=24,
                     borderwidth=0)
         s.configure("Treeview.Heading", background=CARD, foreground=MUTED, relief="flat")
+        s.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "white")])
+        s.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(16, 0, 16, 0))
+        s.configure("TNotebook.Tab", background=CARD, foreground=MUTED, padding=(16, 6), borderwidth=0,
+                    font=("Segoe UI Semibold", 10))
+        s.map("TNotebook.Tab", background=[("selected", ACCENT)], foreground=[("selected", "white")])
         self.option_add("*TCombobox*Listbox.background", "#262a33")
         self.option_add("*TCombobox*Listbox.foreground", FG)
+
+    def _button(self, parent, text, command, primary=False, danger=False):
+        bg = ACCENT if primary else RED if danger else "#262a33"
+        abg = "#3d74e0" if primary else "#e04a43" if danger else "#333844"
+        return tk.Button(parent, text=text, command=command, bg=bg, fg="white" if (primary or danger) else FG,
+                         relief="flat", activebackground=abg, activeforeground="white", cursor="hand2",
+                         padx=10, pady=4)
 
     def _card(self, parent, title):
         f = ttk.Frame(parent, style="Card.TFrame", padding=14)
@@ -363,11 +402,18 @@ class App(tk.Tk):
         self.status_lbl = ttk.Label(header, text="Checking…", style="Sub.TLabel")
         self.status_lbl.pack(anchor="w")
 
-        body = ttk.Frame(self)
-        body.pack(fill="both", expand=True)
-        left = ttk.Frame(body)
+        body_tabs = ttk.Notebook(self)
+        body_tabs.pack(fill="both", expand=True)
+        body = ttk.Frame(body_tabs)
+        vouchers_tab = ttk.Frame(body_tabs)
+        body_tabs.add(body, text="  Hotspot  ")
+        body_tabs.add(vouchers_tab, text="  Vouchers  ")
+        ttk.Frame(body, height=12).pack(fill="x")
+        cols = ttk.Frame(body)
+        cols.pack(fill="both", expand=True)
+        left = ttk.Frame(cols)
         left.pack(side="left", fill="both", expand=True)
-        right = ttk.Frame(body)
+        right = ttk.Frame(cols)
         right.pack(side="left", fill="y")
 
         # Settings
@@ -393,6 +439,12 @@ class App(tk.Tk):
         tk.Button(row, text="⟳", command=self.refresh_adapters, bg="#262a33", fg=FG, relief="flat",
                   activebackground="#333844", activeforeground=FG, width=3).pack(side="left", padx=(6, 0))
 
+        self.portal_on = tk.BooleanVar(value=self.cfg.get("portal", False))
+        ttk.Checkbutton(c, text="Require voucher to get internet (captive portal)", variable=self.portal_on,
+                        style="Card.TCheckbutton", command=self._on_portal_toggle).pack(anchor="w", pady=(10, 0))
+        self.portal_lbl = ttk.Label(c, text="", style="Muted.TLabel")
+        self.portal_lbl.pack(anchor="w")
+
         # Toggle button
         self.toggle_btn = tk.Button(left, text="Start Hotspot", command=self.toggle, font=("Segoe UI Semibold", 12),
                                     bg=ACCENT, fg="white", activebackground="#3d74e0", activeforeground="white",
@@ -402,12 +454,17 @@ class App(tk.Tk):
         # Clients
         c = self._card(left, "Connected devices")
         c.pack_configure(fill="both", expand=True)
-        self.tree = ttk.Treeview(c, columns=("mac", "ip"), show="headings", height=5)
+        self.tree = ttk.Treeview(c, columns=("mac", "ip", "access"), show="headings", height=4)
         self.tree.heading("mac", text="MAC address")
         self.tree.heading("ip", text="IP address")
-        self.tree.column("mac", width=180)
-        self.tree.column("ip", width=140)
+        self.tree.heading("access", text="Access")
+        self.tree.column("mac", width=150)
+        self.tree.column("ip", width=110)
+        self.tree.column("access", width=130)
         self.tree.pack(fill="both", expand=True)
+        self._button(c, "Kick selected to portal", self.kick_selected).pack(anchor="e", pady=(8, 0))
+
+        self._build_vouchers(vouchers_tab)
 
         # QR code
         c = self._card(right, "Scan to connect")
@@ -425,6 +482,215 @@ class App(tk.Tk):
         self.ssid.trace_add("write", lambda *_: self.update_qr())
         self.key.trace_add("write", lambda *_: self.update_qr())
         self.update_qr()
+
+    # ---- Vouchers tab ----
+    def _build_vouchers(self, tab):
+        ttk.Frame(tab, height=12).pack(fill="x")
+        c = self._card(tab, "Create vouchers")
+        row = ttk.Frame(c, style="Card.TFrame")
+        row.pack(fill="x")
+        ttk.Label(row, text="Duration", style="Muted.TLabel").pack(side="left")
+        self.v_duration = ttk.Combobox(row, state="readonly", width=14,
+                                       values=[label for label, _ in captive.DURATIONS])
+        self.v_duration.current(2)
+        self.v_duration.pack(side="left", padx=(6, 16))
+        ttk.Label(row, text="Quantity", style="Muted.TLabel").pack(side="left")
+        self.v_qty = tk.IntVar(value=5)
+        ttk.Spinbox(row, from_=1, to=100, textvariable=self.v_qty, width=5).pack(side="left", padx=(6, 16))
+        self._button(row, "Generate", self.generate_vouchers, primary=True).pack(side="left")
+        self.v_summary = ttk.Label(c, text="", style="Muted.TLabel")
+        self.v_summary.pack(anchor="w", pady=(8, 0))
+
+        c = self._card(tab, "Vouchers")
+        c.pack_configure(fill="both", expand=True)
+        filt = ttk.Frame(c, style="Card.TFrame")
+        filt.pack(fill="x", pady=(0, 6))
+        ttk.Label(filt, text="Show", style="Muted.TLabel").pack(side="left")
+        self.v_filter = ttk.Combobox(filt, state="readonly", width=10,
+                                     values=["All", "Unused", "Active", "Queued", "Expired", "Ended"])
+        self.v_filter.current(0)
+        self.v_filter.bind("<<ComboboxSelected>>", lambda e: self.refresh_vouchers())
+        self.v_filter.pack(side="left", padx=6)
+
+        frame = ttk.Frame(c, style="Card.TFrame")
+        frame.pack(fill="both", expand=True)
+        cols = ("code", "duration", "status", "left", "device", "created")
+        self.vtree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
+        for col, title, w in (("code", "Code", 90), ("duration", "Duration", 90), ("status", "Status", 80),
+                              ("left", "Time left", 100), ("device", "Device", 140), ("created", "Created", 130)):
+            self.vtree.heading(col, text=title)
+            self.vtree.column(col, width=w, anchor="w")
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.vtree.yview)
+        self.vtree.configure(yscrollcommand=sb.set)
+        self.vtree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        self.vtree.tag_configure("Active", foreground=GREEN)
+        self.vtree.tag_configure("Queued", foreground="#ffd60a")
+        self.vtree.tag_configure("Expired", foreground=MUTED)
+        self.vtree.tag_configure("Ended", foreground=MUTED)
+
+        btns = ttk.Frame(c, style="Card.TFrame")
+        btns.pack(fill="x", pady=(8, 0))
+        self._button(btns, "Copy codes", self.copy_vouchers).pack(side="left")
+        self._button(btns, "Print selected / unused", self.print_vouchers).pack(side="left", padx=6)
+        self._button(btns, "End session", self.end_vouchers).pack(side="left")
+        self._button(btns, "Delete", self.delete_vouchers, danger=True).pack(side="right")
+        self._button(btns, "Clear used", self.clear_used_vouchers).pack(side="right", padx=6)
+        self.refresh_vouchers()
+
+    def selected_codes(self) -> list[str]:
+        return [self.vtree.item(i, "values")[0] for i in self.vtree.selection()]
+
+    def generate_vouchers(self):
+        minutes = captive.DURATIONS[self.v_duration.current()][1]
+        try:
+            qty = max(1, min(100, int(self.v_qty.get())))
+        except (tk.TclError, ValueError):
+            qty = 1
+        codes = self.store.generate(qty, minutes)
+        self.refresh_vouchers()
+        for item in self.vtree.get_children():
+            if self.vtree.item(item, "values")[0] in codes:
+                self.vtree.selection_add(item)
+
+    def refresh_vouchers(self):
+        if not hasattr(self, "vtree"):
+            return
+        selected = set(self.selected_codes())
+        flt = self.v_filter.get()
+        now = time.time()
+        self.vtree.delete(*self.vtree.get_children())
+        counts = {}
+        for v in self.store.all():
+            st = self.store.status(v, now)
+            counts[st] = counts.get(st, 0) + 1
+            if flt != "All" and st != flt:
+                continue
+            left = captive.fmt_remaining(self.store.remaining(v, now)) if st in ("Active", "Queued") else ""
+            item = self.vtree.insert("", "end", tags=(st,), values=(
+                v["code"], captive.fmt_minutes(v["minutes"]), st, left, v.get("mac") or "",
+                time.strftime("%b %d %H:%M", time.localtime(v["created"]))))
+            if v["code"] in selected:
+                self.vtree.selection_add(item)
+        self.v_summary.configure(text="   ".join(f"{k}: {counts.get(k, 0)}"
+                                               for k in ("Unused", "Active", "Queued", "Expired", "Ended")))
+
+    def copy_vouchers(self):
+        codes = self.selected_codes() or [v["code"] for v in self.store.all() if self.store.status(v) == "Unused"]
+        if not codes:
+            return
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(codes))
+        messagebox.showinfo(APP_NAME, f"Copied {len(codes)} code(s) to clipboard.")
+
+    def end_vouchers(self):
+        codes = self.selected_codes()
+        if codes and messagebox.askyesno(APP_NAME, f"End {len(codes)} voucher session(s) now?"):
+            for c in codes:
+                self.store.end(c)
+            self.refresh_vouchers()
+
+    def delete_vouchers(self):
+        codes = self.selected_codes()
+        if codes and messagebox.askyesno(APP_NAME, f"Delete {len(codes)} voucher(s)? Active devices lose access."):
+            self.store.delete(codes)
+            self.refresh_vouchers()
+
+    def clear_used_vouchers(self):
+        self.store.delete_used()
+        self.refresh_vouchers()
+
+    def print_vouchers(self):
+        codes = set(self.selected_codes())
+        if codes:
+            vouchers = [v for v in self.store.all() if v["code"] in codes]
+        else:
+            vouchers = [v for v in self.store.all() if self.store.status(v) == "Unused"]
+        if not vouchers:
+            return messagebox.showinfo(APP_NAME, "No vouchers to print. Generate some first.")
+        ssid = html.escape(self.ssid.get().strip())
+        key = html.escape(self.key.get())
+        cards = "".join(
+            f'<div class="v"><div class="t">📶 Hiraya Wifi</div><div class="c">{v["code"]}</div>'
+            f'<div class="d">{captive.fmt_minutes(v["minutes"])}</div>'
+            f'<div class="n">Wi-Fi: <b>{ssid}</b><br>Password: <b>{key}</b></div></div>'
+            for v in vouchers)
+        page = f"""<!doctype html><html><head><meta charset="utf-8"><title>Hiraya Wifi Vouchers</title>
+<style>body{{font-family:Segoe UI,sans-serif;margin:20px}}
+.g{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}}
+.v{{border:2px dashed #555;border-radius:10px;padding:12px;text-align:center;break-inside:avoid}}
+.t{{font-weight:600;color:#2b3a8f}}.c{{font-size:28px;font-weight:700;letter-spacing:4px;margin:6px 0}}
+.d{{font-size:14px;background:#eef;border-radius:6px;padding:2px 0;margin-bottom:6px}}.n{{font-size:11px;color:#444}}
+@media print{{button{{display:none}}}}</style></head><body>
+<button onclick="print()" style="margin-bottom:14px;padding:8px 16px">🖨 Print</button>
+<div class="g">{cards}</div></body></html>"""
+        path = os.path.join(tempfile.gettempdir(), "hiraya_vouchers.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(page)
+        webbrowser.open(f"file:///{path}")
+
+    def kick_selected(self):
+        macs = [self.tree.item(i, "values")[0] for i in self.tree.selection()]
+        if not macs:
+            return messagebox.showinfo(APP_NAME, "Select a device in the list first.")
+        for mac in macs:
+            self.store.end_device(mac)
+        self.refresh_vouchers()
+
+    # ---- captive portal lifecycle ----
+    def _on_portal_toggle(self):
+        self.cfg["portal"] = self.portal_on.get()
+        save_config(self.cfg)
+        if self.portal_on.get() and not self.selected_source():
+            messagebox.showwarning(APP_NAME, "The captive portal needs internet sharing. "
+                                             "Choose an adapter under 'Share internet from'.")
+        self.portal_error = ""
+        self.sync_portal()
+
+    def sync_portal(self):
+        """Start/stop the portal so it matches (hotspot running AND portal enabled)."""
+        if self.portal_busy or self.busy:
+            return
+        want = self.running and self.portal_on.get() and bool(self.selected_source())
+        if want and not self.portal.running and not self.portal_error:
+            self.portal_busy = True
+
+            def work():
+                ok, msg = self.portal.start(hotspot_ip())
+                self.after(0, lambda: self._portal_started(ok, msg))
+            threading.Thread(target=work, daemon=True).start()
+        elif not want and self.portal.running:
+            self.portal_busy = True
+
+            def work():
+                self.portal.stop()
+                self.after(0, self._portal_stopped)
+            threading.Thread(target=work, daemon=True).start()
+        self._update_portal_label()
+
+    def _portal_started(self, ok, msg):
+        self.portal_busy = False
+        if not ok:
+            self.portal_error = msg
+            messagebox.showerror(APP_NAME, msg)
+        self._update_portal_label()
+
+    def _portal_stopped(self):
+        self.portal_busy = False
+        self._update_portal_label()
+
+    def _update_portal_label(self):
+        if self.portal.running:
+            self.portal_lbl.configure(text=f"Portal active at http://{self.portal.ip}/  ·  "
+                                           f"guests must enter a voucher", foreground=GREEN)
+        elif self.portal_busy:
+            self.portal_lbl.configure(text="Starting portal…", foreground=MUTED)
+        elif self.portal_error:
+            self.portal_lbl.configure(text="Portal failed to start (toggle to retry)", foreground=RED)
+        elif self.portal_on.get():
+            self.portal_lbl.configure(text="Portal will start with the hotspot", foreground=MUTED)
+        else:
+            self.portal_lbl.configure(text="Off: anyone with the Wi-Fi password gets internet", foreground=MUTED)
 
     # ---- QR code ----
     def _on_show_key(self):
@@ -491,7 +757,10 @@ class App(tk.Tk):
         if self.busy:
             return
         if self.running:
-            self._run_task(lambda: stop_hotspot(disable_sharing=True), "Stopping…")
+            def stop_all():
+                self.portal.stop()
+                return stop_hotspot(disable_sharing=True)
+            self._run_task(stop_all, "Stopping…")
             return
 
         ssid, key = self.ssid.get().strip(), self.key.get()
@@ -506,6 +775,7 @@ class App(tk.Tk):
             return
         self.cfg.update(ssid=ssid, key=key, source=source)
         save_config(self.cfg)
+        self.portal_error = ""
         self._run_task(lambda: start_hotspot(ssid, key, source), "Starting…", show_result=True)
 
     def _run_task(self, fn, label, show_result=False):
@@ -549,13 +819,34 @@ class App(tk.Tk):
                 bg=RED if self.running else ACCENT,
                 activebackground="#e04a43" if self.running else "#3d74e0",
             )
+        selected = {self.tree.item(i, "values")[0] for i in self.tree.selection()}
         self.tree.delete(*self.tree.get_children())
+        now = time.time()
         for mac in st["clients"]:
-            self.tree.insert("", "end", values=(mac, arp.get(mac, "assigning…")))
+            if self.portal.running:
+                end = self.store.device_end(mac, now)
+                access = f"✓ {captive.fmt_remaining(end - now)} left" if end > now else "Waiting for voucher"
+            else:
+                access = "Open"
+            item = self.tree.insert("", "end", values=(mac, arp.get(mac, "assigning…"), access))
+            if mac in selected:
+                self.tree.selection_add(item)
+        self.refresh_vouchers()
+        self.sync_portal()
 
     def on_close(self):
-        if self.running and messagebox.askyesno(APP_NAME, "Stop the hotspot before closing?"):
-            stop_hotspot(disable_sharing=True)
+        if self.running:
+            ans = messagebox.askyesnocancel(
+                APP_NAME, "Stop the hotspot before closing?\n\n"
+                          "If you keep it running, the voucher portal still stops when the app closes, "
+                          "so connected devices will get internet freely.")
+            if ans is None:
+                return
+            self.portal.stop()
+            if ans:
+                stop_hotspot(disable_sharing=True)
+        else:
+            self.portal.stop()
         self.destroy()
 
 
